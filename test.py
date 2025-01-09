@@ -1,10 +1,12 @@
 import torch
 import torchvision.transforms as transforms
-# import cv2
+from torch.multiprocessing import Process, Queue, set_start_method
 import numpy as np
 import sys
 from tqdm import tqdm
 from pathlib import Path
+import os
+import math
 
 from models.resnet import Resnet34Triplet
 from models.inception_resnet_v1 import InceptionResnetV1
@@ -45,69 +47,66 @@ mtcnn = MTCNN(model_dir='model', margin=0, image_size=140, device=device)
 mtcnn.to(device)
 mtcnn.eval()
 
-old_model = InceptionResnetV1('model').eval()
-old_model.to(device)
-old_model.eval()
+# old_model = InceptionResnetV1('model').eval()
+# old_model.to(device)
+# old_model.eval()
 
-def get_embedding(model, image_path):
-    img = Image.open(image_path).convert('RGB')
-    img = mtcnn(img)
-    # img = mtcnn(img, save_path=f"{image_path}_p.jpeg")
+try:
+    set_start_method('spawn')
+except RuntimeError:
+    pass
 
-    # TODO: only for the new model?
-    img = preprocess(img)
-    img = img.unsqueeze(0)
-    img = img.to(device)
 
-    embedding = model(img)
+def get_embedding(image_path):
+    with torch.no_grad():
+        img = Image.open(image_path).convert('RGB')
+        img = mtcnn(img)
+        # img = mtcnn(img, save_path=f"{image_path}_p.jpeg")
 
-    # Turn embedding Torch Tensor to Numpy array
-    return embedding.cpu().detach().numpy()
+        # TODO: only for the new model?
+        img = preprocess(img)
+        img = img.unsqueeze(0)
+        img = img.to(device)
+
+        embedding = model(img)
+
+        # Turn embedding Torch Tensor to Numpy array
+        return embedding.cpu().detach().numpy()
 
 def l2_distance(emb1, emb2):
     return np.sqrt(np.sum(np.square(np.subtract(emb1, emb2))))
 
-folder = sys.argv[1]
-image_files = []
-valid_extensions = {'.jpg', '.jpeg'}
+# max_filename_length = max(len(file.name) for file in image_files)
+# col_width = max(max_filename_length + 2, 10)
 
-for file in Path(folder).iterdir():
-    if file.suffix.lower() in valid_extensions:
-        image_files.append(file)
+def generate_pairs(image_files):
+    pairs = []
 
-image_files.sort()
-n = len(image_files)
+    for i in range(n):
+        file1 = image_files[i]
 
-max_filename_length = max(len(file.name) for file in image_files)
-col_width = max(max_filename_length + 2, 10)
+        for j in range(i + 1, n):
+            file2 = image_files[j]
 
-outliers = []
+            pairs.append((file1, file2))
 
-def process_and_print(model, threshold):
-    # distance_matrix = np.zeros((n, n))
-    positives = 0
-    total_pairs = n * (n - 1) / 2
+    return pairs
 
-    with tqdm(total=total_pairs) as pbar:
-        for i in range(n):
-            file1 = image_files[i]
-            embedding1 = get_embedding(model, file1)
+def get_distance(file1, file2):
+    # print(file1, file2)
+    embedding1 = get_embedding(file1)
+    embedding2 = get_embedding(file2)
 
-            for j in range(i + 1, n):
-                file2 = image_files[j]
-                embedding2 = get_embedding(model, file2)
+    return (l2_distance(embedding1, embedding2), file1, file2)
 
-                diff = l2_distance(embedding1, embedding2)
-                # distance_matrix[i, j] = diff
-                # distance_matrix[j, i] = diff
+def get_distance_map(q, tasks):
+    for task in tasks:
+        q.put(get_distance(*task))
+        # if (diff < threshold):
+        #     positives+=1
 
-                pbar.update(1)
-
-                if (diff < threshold):
-                    positives+=1
-
-                if (diff < 0.6):
-                    outliers.append((file1.name, file2.name))
+        # if (diff < 0.5):
+        #     outliers.append((file1.name, file2.name, diff))
 
     # # Print column headers
     # print(" " * (col_width), end="")
@@ -122,15 +121,74 @@ def process_and_print(model, threshold):
     #         print(f"{distance_matrix[i,j]:>{col_width}.4f}", end="")
     #     print()
 
+if __name__ == '__main__':
+    folder = sys.argv[1]
+    image_files = []
+    valid_extensions = {'.jpg', '.jpeg'}
+
+    for file in Path(folder).iterdir():
+        if file.suffix.lower() in valid_extensions:
+            image_files.append(file)
+
+    image_files.sort()
+    n = len(image_files)
+    total_pairs = n * (n - 1) / 2
+
+    pairs = generate_pairs(image_files)
+
+    positives = 0
+    outliers = []
+
+    num_cpus = os.cpu_count() or 1
+    q = Queue()
+
+    single_chunk = math.ceil(total_pairs / num_cpus)
+
+    processes = []
+    distances = []
+
+    for i in range(num_cpus):
+        start = i * single_chunk
+        chunk = pairs[start:start + single_chunk]
+        print(f"{i}, {len(chunk)}")
+
+        p = Process(target=get_distance_map, args=(q, chunk))
+        processes.append(p)
+        p.start()
+
+    processed = 0
+
+    with tqdm(total=total_pairs) as t:
+        while True:
+            distances.append(q.get())
+            processed += 1
+            t.update()
+
+            if processed == total_pairs:
+                break
+
+
+    for p in processes:
+        p.join()
+
+    for distance in distances:
+        diff, file1, file2 = distance
+
+        if diff < 0.8:
+            positives += 1
+        if diff < 0.5:
+            outliers.append((file1, file2, distance))
+
     percent_false = (positives / total_pairs) * 100
     print(f"Positives: {positives}/{total_pairs}, {percent_false:.2f}%")
     print(f"Outliers: {outliers}")
 
-if (sys.argv[2] == 'old'):
-    print('FaceNet VGGFace')
-    print("----------------")
-    process_and_print(old_model, 0.8)
-else:
-    print('FaceNet Glint360K')
-    print("----------------")
-    process_and_print(model, 0.8)
+
+    # if (sys.argv[2] == 'old'):
+    #     print('FaceNet VGGFace')
+    #     print("----------------")
+    #     process_and_print(old_model, 0.8)
+    # else:
+    #     print('FaceNet Glint360K')
+    #     print("----------------")
+    #     process_and_print(model, 0.8)
