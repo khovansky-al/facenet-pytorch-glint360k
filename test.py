@@ -47,9 +47,9 @@ mtcnn = MTCNN(model_dir='model', margin=0, image_size=140, device=device)
 mtcnn.to(device)
 mtcnn.eval()
 
-# old_model = InceptionResnetV1('model').eval()
-# old_model.to(device)
-# old_model.eval()
+old_model = InceptionResnetV1('model').eval()
+old_model.to(device)
+old_model.eval()
 
 try:
     set_start_method('spawn')
@@ -58,20 +58,20 @@ except RuntimeError:
 
 
 def get_embedding(image_path):
-    with torch.no_grad():
-        img = Image.open(image_path).convert('RGB')
-        img = mtcnn(img)
-        # img = mtcnn(img, save_path=f"{image_path}_p.jpeg")
+    img = Image.open(image_path)
+    img = mtcnn(img)
+    # img = mtcnn(img, save_path=f"{image_path}_p.jpeg")
 
-        # TODO: only for the new model?
-        img = preprocess(img)
-        img = img.unsqueeze(0)
-        img = img.to(device)
+    # TODO: only for the new model?
+    img = preprocess(img)
+    img = img.unsqueeze(0)
+    img = img.to(device)
 
-        embedding = model(img)
+    embedding = model(img)
+    # embedding = old_model(img)
 
-        # Turn embedding Torch Tensor to Numpy array
-        return embedding.cpu().detach().numpy()
+    # Turn embedding Torch Tensor to Numpy array
+    return embedding.cpu().detach().numpy()
 
 def l2_distance(emb1, emb2):
     return np.sqrt(np.sum(np.square(np.subtract(emb1, emb2))))
@@ -131,6 +131,7 @@ if __name__ == '__main__':
             image_files.append(file)
 
     image_files.sort()
+    image_files = image_files[:20]
     n = len(image_files)
     total_pairs = n * (n - 1) / 2
 
@@ -139,45 +140,52 @@ if __name__ == '__main__':
     positives = 0
     outliers = []
 
-    num_cpus = os.cpu_count() or 1
-    q = Queue()
+    # num_cpus = os.cpu_count() or 1
+    # q = Queue()
 
-    single_chunk = math.ceil(total_pairs / num_cpus)
+    # single_chunk = math.ceil(total_pairs / num_cpus)
 
-    processes = []
+    # processes = []
     distances = []
 
-    for i in range(num_cpus):
-        start = i * single_chunk
-        chunk = pairs[start:start + single_chunk]
-        print(f"{i}, {len(chunk)}")
+    # for i in range(num_cpus):
+    #     start = i * single_chunk
+    #     chunk = pairs[start:start + single_chunk]
+    #     print(f"{i}, {len(chunk)}")
 
-        p = Process(target=get_distance_map, args=(q, chunk))
-        processes.append(p)
-        p.start()
+    #     p = Process(target=get_distance_map, args=(q, chunk))
+    #     processes.append(p)
+    #     p.start()
 
-    processed = 0
+    # processed = 0
+
+    # with tqdm(total=total_pairs) as t:
+    #     while True:
+    #         distances.append(q.get())
+    #         processed += 1
+    #         t.update()
+
+    #         if processed == total_pairs:
+    #             break
+
+
+    # for p in processes:
+    #     p.join()
 
     with tqdm(total=total_pairs) as t:
-        while True:
-            distances.append(q.get())
-            processed += 1
+        for file1, file2 in pairs:
+            distances.append(get_distance(file1, file2))
             t.update()
 
-            if processed == total_pairs:
-                break
-
-
-    for p in processes:
-        p.join()
 
     for distance in distances:
         diff, file1, file2 = distance
 
         if diff < 0.8:
+            print(f"fp: {diff}")
             positives += 1
         if diff < 0.5:
-            outliers.append((file1, file2, distance))
+            outliers.append((file1, file2, diff))
 
     percent_false = (positives / total_pairs) * 100
     print(f"Positives: {positives}/{total_pairs}, {percent_false:.2f}%")
